@@ -1,0 +1,84 @@
+name: Android CI Build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle 8.4
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.4'
+
+      - name: Unzip project (newest zip only)
+        run: |
+          newest=$(ls -t ./*.zip 2>/dev/null | head -n1 || true)
+          if [ -z "$newest" ]; then
+            echo "No .zip in repo root, using files as they are."
+          else
+            echo "Unzipping $newest"
+            unzip -oq "$newest"
+          fi
+
+      - name: Locate project
+        id: locate
+        run: |
+          settings=$(find . -name settings.gradle.kts -not -path './.git/*' | awk '{ print length, $0 }' | sort -n | head -n1 | cut -d' ' -f2-)
+          if [ -z "$settings" ]; then
+            echo "::error::settings.gradle.kts not found"
+            exit 1
+          fi
+          dir=$(dirname "$settings")
+          echo "Project dir: $dir"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      - name: Build debug APK
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          set -o pipefail
+          gradle :android:assembleDebug --stacktrace --no-daemon --console=plain 2>&1 | tee build.log
+
+      - name: Show errors
+        if: failure()
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          echo "===== Kotlin / Gradle errors ====="
+          grep -E "^e: |error:|What went wrong|Execution failed" -A4 build.log | head -150 || true
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ steps.locate.outputs.dir }}/build.log
+          if-no-files-found: ignore
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: IRON-FRONT-debug-apk
+          path: ${{ steps.locate.outputs.dir }}/android/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
