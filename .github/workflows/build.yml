@@ -25,8 +25,30 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # GitHub-hosted Ubuntu runners already include the Android command-line
+      # tools. Install only valid SDK package IDs; the legacy package "tools"
+      # is no longer available and causes sdkmanager to exit with code 1.
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT/cmdline-tools" ]; then
+            echo "::error::Android SDK command-line tools were not found on the runner."
+            exit 1
+          fi
+
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager executable was not found."
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses || true
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0"
 
       - name: Set up Gradle 8.4
         uses: gradle/actions/setup-gradle@v4
@@ -34,8 +56,10 @@ jobs:
           gradle-version: '8.4'
 
       - name: Unzip project (newest zip only)
+        shell: bash
         run: |
-          newest=$(ls -t ./*.zip 2>/dev/null | head -n1 || true)
+          set -euo pipefail
+          newest="$(ls -t ./*.zip 2>/dev/null | head -n 1 || true)"
           if [ -z "$newest" ]; then
             echo "No .zip in repo root, using files as they are."
           else
@@ -45,18 +69,21 @@ jobs:
 
       - name: Locate project
         id: locate
+        shell: bash
         run: |
-          settings=$(find . -name settings.gradle.kts -not -path './.git/*' | awk '{ print length, $0 }' | sort -n | head -n1 | cut -d' ' -f2-)
+          set -euo pipefail
+          settings="$(find . -name settings.gradle.kts -not -path './.git/*' | awk '{ print length, $0 }' | sort -n | head -n 1 | cut -d' ' -f2-)"
           if [ -z "$settings" ]; then
             echo "::error::settings.gradle.kts not found"
             exit 1
           fi
-          dir=$(dirname "$settings")
+          dir="$(dirname "$settings")"
           echo "Project dir: $dir"
           echo "dir=$dir" >> "$GITHUB_OUTPUT"
 
       - name: Build debug APK
         working-directory: ${{ steps.locate.outputs.dir }}
+        shell: bash
         run: |
           set -o pipefail
           gradle :android:assembleDebug --stacktrace --no-daemon --console=plain 2>&1 | tee build.log
@@ -64,9 +91,10 @@ jobs:
       - name: Show errors
         if: failure()
         working-directory: ${{ steps.locate.outputs.dir }}
+        shell: bash
         run: |
           echo "===== Kotlin / Gradle errors ====="
-          grep -E "^e: |error:|What went wrong|Execution failed" -A4 build.log | head -150 || true
+          grep -E "^e: |error:|What went wrong|Execution failed|Could not" -A4 build.log | head -150 || true
 
       - name: Upload build log
         if: failure()
@@ -77,6 +105,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Upload debug APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: IRON-FRONT-debug-apk
