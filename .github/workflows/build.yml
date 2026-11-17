@@ -10,10 +10,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       - name: Checkout repository
@@ -25,89 +29,62 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      # GitHub-hosted Ubuntu runners already include the Android command-line
-      # tools. Install only valid SDK package IDs; the legacy package "tools"
-      # is no longer available and causes sdkmanager to exit with code 1.
-      - name: Install Android SDK packages
-        shell: bash
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform and build tools
         run: |
-          set -euo pipefail
-          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
-          if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT/cmdline-tools" ]; then
-            echo "::error::Android SDK command-line tools were not found on the runner."
-            exit 1
-          fi
-
-          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)"
-          if [ -z "$SDKMANAGER" ]; then
-            echo "::error::sdkmanager executable was not found."
-            exit 1
-          fi
-
-          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses || true
-          "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
-            "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0"
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
       - name: Set up Gradle 8.4
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.4'
 
-      - name: Unzip project (newest zip only)
-        shell: bash
+      - name: Unzip project if it is a zip
         run: |
-          set -euo pipefail
-          newest="$(ls -t ./*.zip 2>/dev/null | head -n 1 || true)"
-          if [ -z "$newest" ]; then
-            echo "No .zip in repo root, using files as they are."
+          shopt -s nullglob
+          zips=(*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "No .zip in repo root, using the files as they are."
           else
-            echo "Unzipping $newest"
-            unzip -oq "$newest"
+            for z in "${zips[@]}"; do
+              echo "Unzipping $z"
+              unzip -oq "$z"
+            done
           fi
 
       - name: Locate project
         id: locate
-        shell: bash
         run: |
-          set -euo pipefail
-          settings="$(find . -name settings.gradle.kts -not -path './.git/*' | awk '{ print length, $0 }' | sort -n | head -n 1 | cut -d' ' -f2-)"
-          if [ -z "$settings" ]; then
+          found=$(find . -name settings.gradle.kts -not -path './.git/*' | awk '{ print length, $0 }' | sort -n | head -n1 | cut -d' ' -f2-)
+          if [ -z "$found" ]; then
             echo "::error::settings.gradle.kts not found"
             exit 1
           fi
-          dir="$(dirname "$settings")"
+          dir=$(dirname "$found")
           echo "Project dir: $dir"
           echo "dir=$dir" >> "$GITHUB_OUTPUT"
 
       - name: Build debug APK
         working-directory: ${{ steps.locate.outputs.dir }}
-        shell: bash
-        run: |
-          set -o pipefail
-          gradle :android:assembleDebug --stacktrace --no-daemon --console=plain 2>&1 | tee build.log
+        run: gradle :android:assembleDebug --stacktrace --no-daemon
 
-      - name: Show errors
-        if: failure()
+      - name: Name the APK and show its signing key
         working-directory: ${{ steps.locate.outputs.dir }}
-        shell: bash
         run: |
-          echo "===== Kotlin / Gradle errors ====="
-          grep -E "^e: |error:|What went wrong|Execution failed|Could not" -A4 build.log | head -150 || true
-
-      - name: Upload build log
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: ${{ steps.locate.outputs.dir }}/build.log
-          if-no-files-found: ignore
+          VERSION=$(grep -oP 'versionName = "\K[^"]+' android/build.gradle.kts | head -n1)
+          APK=$(ls android/build/outputs/apk/debug/*.apk | head -n1)
+          mv "$APK" "android/build/outputs/apk/debug/IRON-FRONT-v${VERSION}.apk"
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          echo "The SHA-256 below must be the SAME on every build, so the app can be updated without uninstalling:"
+          "$SDK/build-tools/34.0.0/apksigner" verify --print-certs "android/build/outputs/apk/debug/IRON-FRONT-v${VERSION}.apk" | head -n 3
 
       - name: Upload debug APK
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: IRON-FRONT-debug-apk
           path: ${{ steps.locate.outputs.dir }}/android/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+          retention-days: 30
